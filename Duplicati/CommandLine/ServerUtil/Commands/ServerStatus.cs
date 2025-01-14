@@ -18,22 +18,32 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
 // DEALINGS IN THE SOFTWARE.
+using System.CommandLine;
+using System.CommandLine.NamingConventionBinder;
 
-using SharpCompress.Common;
-using SharpCompress.Compressors.Deflate;
+namespace Duplicati.CommandLine.ServerUtil.Commands;
 
-namespace Duplicati.Library.Compression.ZipCompression;
+public static class ServerStatus
+{
+    public static Command Create() =>
+        new Command("status", "Gets the server status")
+        .WithHandler(CommandHandler.Create<Settings>(async (settings) =>
+        {
+            var state = await (await settings.GetConnection()).GetServerState();
+            Console.WriteLine($"Server state: {state.ProgramState}");
+            if (state.ActiveTask != null)
+                Console.WriteLine($"Active task: [Task {state.ActiveTask.Item1}]: BackupId = {state.ActiveTask.Item2}");
+            else
+                Console.WriteLine("Active task: None");
 
-/// <summary>
-/// The zip options parsed from the command line
-/// </summary>
-/// <param name="DeflateCompressionLevel">The compression level to use</param>
-/// <param name="CompressionType">The compression type to use</param>
-/// <param name="UseZip64">Whether to use zip64 extensions</param>
-/// <param name="UnittestMode">Flag indicating if unittest mode is enabled</param>
-public sealed record ParsedZipOptions(
-    CompressionLevel DeflateCompressionLevel,
-    CompressionType CompressionType,
-    bool UseZip64,
-    bool UnittestMode
-);
+            if (state.SchedulerQueueIds.Any())
+            {
+                Console.WriteLine("Scheduled tasks:");
+                foreach (var id in state.SchedulerQueueIds)
+                    Console.WriteLine($"  [Task {id.Item1}]: BackupId = {id.Item2}");
+            }
+            else
+                Console.WriteLine("Scheduler tasks: Empty");
+        }));
+
+}
