@@ -33,6 +33,7 @@ using System.Threading.Tasks;
 using Duplicati.Library.Backend.pCloud;
 using Duplicati.Library.Utility;
 using Uri = System.Uri;
+using System.Runtime.CompilerServices;
 
 namespace Duplicati.Library.Backend;
 
@@ -222,18 +223,12 @@ public class pCloudBackend : IStreamingBackend
     /// Implementation of interface method for listing remote folder contents
     /// </summary>
     /// <returns>List of IFileEntry with directory listing result</returns>
-    public async Task<IEnumerable<IFileEntry>> ListAsync(CancellationToken cancellationToken)
+    public async IAsyncEnumerable<IFileEntry> ListAsync([EnumeratorCancellation] CancellationToken cancellationToken)
     {
         _CachedFolderID ??= await GetFolderId(cancellationToken).ConfigureAwait(false);
-
-        return await List(_CachedFolderID.Value, cancellationToken).ConfigureAwait(false);
+        foreach (var v in await List(_CachedFolderID.Value, cancellationToken).ConfigureAwait(false))
+            yield return v;
     }
-
-    /// <summary>
-    /// Wrapper method of legacy non async call to list files in the remote folder
-    /// </summary>
-    /// <returns></returns>
-    public IEnumerable<IFileEntry> List() => ListAsync(CancellationToken.None).Await();
 
     /// <summary>
     /// Upload files to remote location
@@ -323,7 +318,7 @@ public class pCloudBackend : IStreamingBackend
         timeoutToken.CancelAfter(TimeSpan.FromSeconds(SHORT_OPERATION_TIMEOUT_SECONDS));
         using var combinedTokens =
             CancellationTokenSource.CreateLinkedTokenSource(timeoutToken.Token, cancellationToken);
-        
+
         using var requestResources = CreateRequest($"/getfilelink?fileid={await GetFileId(filename, cancellationToken).ConfigureAwait(false)}", HttpMethod.Get);
 
         using var response = await requestResources.HttpClient.SendAsync(
@@ -513,15 +508,15 @@ public class pCloudBackend : IStreamingBackend
     /// </summary>
     /// <param name="name">The filename</param>
     /// <param name="cancellationToken">Cancellation Token</param>
-    /// <returns></returns>
-    /// <exception cref="FileNotFoundException"></exception>
+    /// <returns>The fileID</returns>
+    /// <exception cref="FileMissingException"></exception>
     private async Task<ulong> GetFileId(string name, CancellationToken cancellationToken)
     {
         _CachedFolderID ??= await GetFolderId(cancellationToken).ConfigureAwait(false);
 
         var result = await ListWithMetadata((ulong)_CachedFolderID, cancellationToken).ConfigureAwait(false);
 
-        return result.FirstOrDefault(x => !x.isfolder && x.name == name)?.fileid ?? throw new FileNotFoundException(name);
+        return result.FirstOrDefault(x => !x.isfolder && x.name == name)?.fileid ?? throw new FileMissingException(name);
 
     }
 

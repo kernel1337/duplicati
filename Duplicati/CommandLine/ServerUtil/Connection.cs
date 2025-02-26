@@ -21,6 +21,7 @@
 using System.Net.Http.Json;
 using System.Net.Security;
 using System.Text.Json;
+using Duplicati.Library.AutoUpdater;
 
 namespace Duplicati.CommandLine.ServerUtil;
 
@@ -83,6 +84,18 @@ public class Connection
         long TaskID,
         string BackupID,
         string Operation
+    );
+
+    /// <summary>
+    /// The server state
+    /// </summary>
+    /// <param name="ActiveTask">The active task, if any</param>
+    /// <param name="ProgramState">The state of the server</param>
+    /// <param name="SchedulerQueueIds">The IDs of the tasks in the scheduler queue</param>
+    public sealed record ServerState(
+        Tuple<long, string>? ActiveTask,
+        string ProgramState,
+        IList<Tuple<long, string>> SchedulerQueueIds
     );
 
     /// <summary>
@@ -173,10 +186,9 @@ public class Connection
         try
         {
             var opts = new Dictionary<string, string>();
-            if (!string.IsNullOrWhiteSpace(settings.ServerDatafolder))
-                opts.Add("server-datafolder", settings.ServerDatafolder);
-
-            if (File.Exists(Path.Combine(Server.Program.GetDataFolderPath(opts), Server.Program.SERVER_DATABASE_FILENAME)))
+            if (settings.Key != null)
+                opts["settings-encryption-key"] = settings.Key.Key;
+            if (File.Exists(Path.Combine(DataFolderManager.DATAFOLDER, DataFolderManager.SERVER_DATABASE_FILENAME)))
             {
                 string? cfg = null;
                 using (var connection = Duplicati.Server.Program.GetDatabaseConnection(opts, true))
@@ -208,9 +220,9 @@ public class Connection
                     return CreateConnectionWithClient(client, accessToken);
                 }
             }
-            else if (!string.IsNullOrWhiteSpace(settings.ServerDatafolder))
+            else if (!string.IsNullOrWhiteSpace(DataFolderManager.DATAFOLDER))
             {
-                Console.WriteLine($"No database found in {settings.ServerDatafolder}");
+                Console.WriteLine($"No database found in {DataFolderManager.DATAFOLDER}");
             }
         }
         catch (Exception ex)
@@ -363,6 +375,54 @@ public class Connection
     {
         var response = await client.PostAsync($"backup/{Uri.EscapeDataString(backupId)}/run", null);
         await EnsureSuccessStatusCodeWithParsing(response);
+    }
+
+    /// <summary>
+    /// Gets the server state
+    /// </summary>
+    /// <returns>The server state</returns>
+    public async Task<ServerState> GetServerState()
+    {
+        var response = await client.GetAsync($"serverstate");
+        await EnsureSuccessStatusCodeWithParsing(response);
+        return await response.Content.ReadFromJsonAsync<ServerState>()
+            ?? throw new InvalidDataException("Failed to parse server response");
+    }
+
+    /// <summary>
+    /// Runs a backup
+    /// </summary>
+    /// <param name="backupId">The ID of the backup</param>
+    /// <returns>The task</returns>
+    public async Task WaitForBackup(string backupId, TimeSpan delay, Action<string> statusMessage)
+    {
+        var state = await GetServerState();
+
+        if (!state.SchedulerQueueIds.Any(x => x.Item2 == backupId) && state.ActiveTask?.Item2 != backupId)
+            throw new UserReportedException("Backup is not queued or running");
+
+        var hasStarted = state.ActiveTask?.Item2 == backupId;
+
+        while (true)
+        {
+            await Task.Delay(delay);
+            state = await GetServerState();
+
+            if (state.ActiveTask?.Item2 == backupId)
+            {
+                statusMessage("Backup is running ...");
+                hasStarted = true;
+                continue;
+            }
+
+            if (!hasStarted && state.SchedulerQueueIds.Any(x => x.Item2 == backupId))
+            {
+                statusMessage("Backup is queued ...");
+                continue;
+            }
+
+            break;
+        }
     }
 
     /// <summary>

@@ -27,12 +27,13 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace Duplicati.Library.Backend
 {
-    public class WEBDAV : IBackend, IStreamingBackend
+    public class WEBDAV : IStreamingBackend
     {
         private record RequestResources : IDisposable
         {
@@ -75,7 +76,7 @@ namespace Duplicati.Library.Backend
         /// It is used to detect a problem with IIS where a file is listed,
         /// but IIS responds 404 because the file mapping is incorrect.
         /// </summary>
-        private List<string> m_filenamelist = null;
+        private HashSet<string> m_filenamelist = null;
 
         // According to the WEBDAV standard, the "allprop" request should return all properties, however this seems to fail on some servers (box.net).
         // I've found this description: http://www.webdav.org/specs/rfc2518.html#METHOD_PROPFIND
@@ -83,24 +84,24 @@ namespace Duplicati.Library.Backend
         //
         //private static readonly byte[] PROPFIND_BODY = System.Text.Encoding.UTF8.GetBytes("<?xml version=\"1.0\"?><D:propfind xmlns:D=\"DAV:\"><D:allprop/></D:propfind>");
         private static readonly byte[] PROPFIND_BODY = new byte[0];
-        
+
         /// <summary>
         /// Option to accept any SSL certificate
         /// </summary>
         private readonly bool m_acceptAnyCertificate;
-        
+
         /// <summary>
         /// Specific hashes to be accepted by the certificate validator
         /// </summary>
         private readonly string[] m_acceptSpecificCertificates;
 
-        /// <summary>
-        /// The default timeout in seconds for PUT/GET file operations
-        /// </summary>
-        private const int LONG_OPERATION_TIMEOUT_SECONDS = 30000;
+        /// <summary> 
+        /// The default timeout in seconds for List operations
+        /// </summary> 
+        private const int LIST_OPERATION_TIMEOUT_SECONDS = 600;
 
         /// <summary>
-        /// The default timeout in seconds for LIST/CreateFolder operations
+        /// The default timeout in seconds for Delete/CreateFolder operations
         /// </summary>
         private const int SHORT_OPERATION_TIMEOUT_SECONDS = 30;
 
@@ -161,20 +162,36 @@ namespace Duplicati.Library.Backend
             m_sanitizedUrl = new Utility.Uri(m_useSSL ? "https" : "http", u.Host, m_path).ToString();
             m_reverseProtocolUrl = new Utility.Uri(m_useSSL ? "http" : "https", u.Host, m_path).ToString();
             m_acceptAnyCertificate = options.ContainsKey("accept-any-ssl-certificate") && Utility.Utility.ParseBoolOption(options, "accept-any-ssl-certificate");
-            m_acceptSpecificCertificates = options.ContainsKey("accept-specified-ssl-hash") ? options["accept-specified-ssl-hash"].Split([",", ";"], StringSplitOptions.RemoveEmptyEntries): null;
+            m_acceptSpecificCertificates = options.ContainsKey("accept-specified-ssl-hash") ? options["accept-specified-ssl-hash"].Split([",", ";"], StringSplitOptions.RemoveEmptyEntries) : null;
         }
 
         #region IBackend Members
 
+        ///<inheritdoc/>
         public string DisplayName => Strings.WEBDAV.DisplayName;
 
+        ///<inheritdoc/>
         public string ProtocolKey => "webdav";
 
-        public IEnumerable<IFileEntry> List()
+        ///<inheritdoc/>
+        public async IAsyncEnumerable<IFileEntry> ListAsync([EnumeratorCancellation] CancellationToken cancelToken)
         {
+            using var timeoutToken = new CancellationTokenSource();
+            timeoutToken.CancelAfter(TimeSpan.FromSeconds(LIST_OPERATION_TIMEOUT_SECONDS));
+
+            using var requestResources = CreateRequest(string.Empty, new HttpMethod("PROPFIND"));
+            requestResources.RequestMessage.Headers.Add("Depth", "1");
+            requestResources.RequestMessage.Content = new StreamContent(new MemoryStream(PROPFIND_BODY));
+            requestResources.RequestMessage.Content.Headers.ContentLength = PROPFIND_BODY.Length;
+
+            var doc = new System.Xml.XmlDocument();
+
             try
             {
-                return ListWithouExceptionCatch();
+                using var response = await requestResources.HttpClient.SendAsync(requestResources.RequestMessage, HttpCompletionOption.ResponseContentRead, timeoutToken.Token).ConfigureAwait(false);
+                response.EnsureSuccessStatusCode();
+                using var stream = await response.Content.ReadAsStreamAsync(cancelToken).ConfigureAwait(false);
+                doc.Load(stream);
             }
             catch (HttpRequestException wex)
             {
@@ -186,32 +203,11 @@ namespace Duplicati.Library.Backend
 
                 throw;
             }
-        }
 
-        private IEnumerable<IFileEntry> ListWithouExceptionCatch()
-        {
-            using var timeoutToken = new CancellationTokenSource();
-            timeoutToken.CancelAfter(TimeSpan.FromSeconds(SHORT_OPERATION_TIMEOUT_SECONDS));
-
-            using var requestResources = CreateRequest(string.Empty, new HttpMethod("PROPFIND"));
-            requestResources.RequestMessage.Headers.Add("Depth", "1");
-            requestResources.RequestMessage.Content = new StreamContent(new MemoryStream(PROPFIND_BODY));
-            requestResources.RequestMessage.Content.Headers.ContentLength = PROPFIND_BODY.Length;
-
-            using var response = requestResources.HttpClient.SendAsync(requestResources.RequestMessage, HttpCompletionOption.ResponseContentRead, timeoutToken.Token).ConfigureAwait(false).GetAwaiter().GetResult();
-
-            response.EnsureSuccessStatusCode(); // This replaces the if needed when Mono was used.
-
-            var doc = new System.Xml.XmlDocument();
-
-            doc.Load(response.Content.ReadAsStream());
-
-            System.Xml.XmlNamespaceManager nm = new System.Xml.XmlNamespaceManager(doc.NameTable);
+            var nm = new System.Xml.XmlNamespaceManager(doc.NameTable);
             nm.AddNamespace("D", "DAV:");
 
-            List<IFileEntry> files = new List<IFileEntry>();
-            m_filenamelist = new List<string>();
-
+            var filenamelist = new HashSet<string>();
             foreach (System.Xml.XmlNode n in doc.SelectNodes("D:multistatus/D:response/D:href", nm))
             {
                 //IIS uses %20 for spaces and %2B for +
@@ -271,51 +267,58 @@ namespace Duplicati.Library.Backend
                         isCollection = stat.SelectSingleNode("D:resourcetype/D:collection", nm) != null;
                 }
 
-                FileEntry fe = new FileEntry(name, size, lastAccess, lastModified);
-                fe.IsFolder = isCollection;
-                files.Add(fe);
-                m_filenamelist.Add(name);
+                var fe = new FileEntry(name, size, lastAccess, lastModified)
+                {
+                    IsFolder = isCollection
+                };
+
+                filenamelist.Add(name);
+                yield return fe;
             }
 
-            return files;
+            m_filenamelist = filenamelist;
         }
 
+        ///<inheritdoc/>
         public async Task PutAsync(string remotename, string filename, CancellationToken cancelToken)
         {
-            using (FileStream fs = File.OpenRead(filename))
-                await PutAsync(remotename, fs, cancelToken);
+            await using FileStream fs = File.OpenRead(filename);
+            await PutAsync(remotename, fs, cancelToken).ConfigureAwait(false);
         }
 
+        ///<inheritdoc/>
         public async Task GetAsync(string remotename, string filename, CancellationToken cancelToken)
         {
-            using (var fs = File.Create(filename))
-                await GetAsync(remotename, fs, cancelToken);
+            await using var fs = File.Create(filename);
+            await GetAsync(remotename, fs, cancelToken).ConfigureAwait(false);
         }
 
+        ///<inheritdoc/>
         public async Task DeleteAsync(string remotename, CancellationToken cancelToken)
         {
             try
             {
                 using var timeoutToken = new CancellationTokenSource();
                 timeoutToken.CancelAfter(TimeSpan.FromSeconds(SHORT_OPERATION_TIMEOUT_SECONDS));
+                using var combinedTokens = CancellationTokenSource.CreateLinkedTokenSource(timeoutToken.Token, cancelToken);
 
                 using var requestResources = CreateRequest(remotename);
                 requestResources.RequestMessage.Method = HttpMethod.Delete;
 
-                var response = await requestResources.HttpClient.SendAsync(requestResources.RequestMessage, timeoutToken.Token);
+                var response = await requestResources.HttpClient.SendAsync(requestResources.RequestMessage, combinedTokens.Token).ConfigureAwait(false);
 
-                response.EnsureSuccessStatusCode(); // This replaces the if needed when Mono was used.
+                response.EnsureSuccessStatusCode();
 
             }
             catch (HttpRequestException wex)
             {
                 if (wex.StatusCode == HttpStatusCode.NotFound)
                     throw new FileMissingException(wex);
-                else
-                    throw;
+                throw;
             }
         }
 
+        ///<inheritdoc/>
         public IList<ICommandLineArgument> SupportedCommands
         {
             get
@@ -332,29 +335,28 @@ namespace Duplicati.Library.Backend
             }
         }
 
-        public string Description
-        {
-            get { return Strings.WEBDAV.Description; }
-        }
+        ///<inheritdoc/>
+        public string Description => Strings.WEBDAV.Description;
 
+        ///<inheritdoc/>
         public Task<string[]> GetDNSNamesAsync(CancellationToken cancelToken) => Task.FromResult(new[] { m_dnsName });
 
+        ///<inheritdoc/>
         public Task TestAsync(CancellationToken cancelToken)
-        {
-            List();
-            return Task.CompletedTask;
-        }
+            => this.TestListAsync(cancelToken);
 
+        ///<inheritdoc/>
         public async Task CreateFolderAsync(CancellationToken cancelToken)
         {
-            using var timeoutToken = CancellationTokenSource.CreateLinkedTokenSource(cancelToken);
+            using var timeoutToken = new CancellationTokenSource();
             timeoutToken.CancelAfter(TimeSpan.FromSeconds(SHORT_OPERATION_TIMEOUT_SECONDS));
+            using var combinedTokens = CancellationTokenSource.CreateLinkedTokenSource(timeoutToken.Token, cancelToken);
 
             using var requestResources = CreateRequest(string.Empty, new HttpMethod("MKCOL"));
 
-            using var response = await requestResources.HttpClient.SendAsync(requestResources.RequestMessage, timeoutToken.Token).ConfigureAwait(false);
+            using var response = await requestResources.HttpClient.SendAsync(requestResources.RequestMessage, combinedTokens.Token).ConfigureAwait(false);
 
-            response.EnsureSuccessStatusCode(); // This replaces the if needed when Mono was used.
+            response.EnsureSuccessStatusCode();
         }
 
         #endregion
@@ -395,12 +397,13 @@ namespace Duplicati.Library.Backend
                     Convert.ToBase64String(System.Text.Encoding.ASCII.GetBytes($"{m_userInfo.UserName}:{m_userInfo.Password}"))
                 );
             }
-            
+
             httpClient.Timeout = Timeout.InfiniteTimeSpan;
 
             var request = new HttpRequestMessage(HttpMethod.Get, $"{m_url}{Utility.Uri.UrlEncode(remotename).Replace("+", "%20")}");
             request.Headers.Add(HttpRequestHeader.UserAgent.ToString(), "Duplicati WEBDAV Client v" + System.Reflection.Assembly.GetExecutingAssembly().GetName().Version);
-            request.Headers.ConnectionClose = true; // Equivalent to KeepAlive = false
+
+            request.Headers.ConnectionClose = !m_useIntegratedAuthentication; // ConnectionClose is incompatible with integrated authentication
 
             if (method != null)
                 request.Method = method;
@@ -411,14 +414,11 @@ namespace Duplicati.Library.Backend
 
         #region IStreamingBackend Members
 
+        ///<inheritdoc/>
         public async Task PutAsync(string remotename, Stream stream, CancellationToken cancelToken)
         {
             try
             {
-                using var timeoutToken = new CancellationTokenSource();
-                timeoutToken.CancelAfter(TimeSpan.FromSeconds(LONG_OPERATION_TIMEOUT_SECONDS));
-                using var combinedTokens = CancellationTokenSource.CreateLinkedTokenSource(timeoutToken.Token, cancelToken);
-
                 using var requestResources = CreateRequest(remotename, HttpMethod.Put);
 
                 requestResources.RequestMessage.Content = new StreamContent(stream);
@@ -426,9 +426,9 @@ namespace Duplicati.Library.Backend
                 requestResources.RequestMessage.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
                 requestResources.RequestMessage.Version = HttpVersion.Version11;
 
-                using var response = await requestResources.HttpClient.SendAsync(requestResources.RequestMessage, HttpCompletionOption.ResponseHeadersRead, combinedTokens.Token);
+                using var response = await requestResources.HttpClient.SendAsync(requestResources.RequestMessage, HttpCompletionOption.ResponseHeadersRead, cancelToken).ConfigureAwait(false);
 
-                response.EnsureSuccessStatusCode(); // This replaces the if needed when Mono was used.
+                response.EnsureSuccessStatusCode();
             }
             catch (HttpRequestException wex)
             {
@@ -439,17 +439,14 @@ namespace Duplicati.Library.Backend
             }
         }
 
+        ///<inheritdoc/>
         public async Task GetAsync(string remotename, Stream stream, CancellationToken cancelToken)
         {
             try
             {
-                using var timeoutToken = CancellationTokenSource.CreateLinkedTokenSource(cancelToken);
-                timeoutToken.CancelAfter(TimeSpan.FromSeconds(LONG_OPERATION_TIMEOUT_SECONDS));
-
                 using var requestResources = CreateRequest(remotename, HttpMethod.Get);
 
-                await requestResources.HttpClient.DownloadFile(requestResources.RequestMessage, stream, null, timeoutToken.Token).ConfigureAwait(false);
-
+                await requestResources.HttpClient.DownloadFile(requestResources.RequestMessage, stream, null, cancelToken).ConfigureAwait(false);
             }
             catch (HttpRequestException wex)
             {

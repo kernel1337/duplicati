@@ -22,7 +22,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reactive.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Duplicati.Library.Interface;
 using Duplicati.Library.Utility;
@@ -58,13 +60,33 @@ namespace Duplicati.Library.Backend
             m_dnsHost = servername;
         }
 
-        public IEnumerable<IFileEntry> ListBucket(string bucketName, string prefix)
+        private static async IAsyncEnumerable<T> ToAsyncEnumerable<T>(
+            IObservable<T> observable,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            var channel = Channel.CreateUnbounded<T>(); // Buffered channel for async iteration
+
+            using var subscription = observable.Subscribe(
+                item => channel.Writer.TryWrite(item),
+                ex => channel.Writer.TryComplete(ex),
+                () => channel.Writer.TryComplete()
+            );
+
+            while (await channel.Reader.WaitToReadAsync(cancellationToken))
+            {
+                while (channel.Reader.TryRead(out var item))
+                {
+                    yield return item;
+                }
+            }
+        }
+
+        public async IAsyncEnumerable<IFileEntry> ListBucketAsync(string bucketName, string prefix, [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             ThrowExceptionIfBucketDoesNotExist(bucketName);
 
-            var observable = m_client.ListObjectsAsync(bucketName, prefix, true);
-
-            foreach (var obj in observable.ToEnumerable())
+            var observable = m_client.ListObjectsAsync(bucketName, prefix, true, cancellationToken);
+            await foreach (var obj in ToAsyncEnumerable(observable, cancellationToken).ConfigureAwait(false))
             {
                 yield return new Common.IO.FileEntry(
                     obj.Key,
@@ -85,6 +107,7 @@ namespace Duplicati.Library.Backend
             {
                 Logging.Log.WriteErrorMessage(Logtag, "ErrorMakingBucketMinio", null,
                     "Error making bucket {0} using Minio: {1}", bucketName, e.ToString());
+                throw;
             }
         }
 
@@ -99,6 +122,9 @@ namespace Duplicati.Library.Backend
                 Logging.Log.WriteErrorMessage(Logtag, "ErrorRemovingObjectMinio", null,
                     "Error removing from bucket {0} object {1} using Minio: {1}",
                     bucketName, keyName, e.ToString());
+
+                ParseAndThrowNotFoundException(e, keyName, bucketName);
+                throw;
             }
         }
 
@@ -114,6 +140,8 @@ namespace Duplicati.Library.Backend
                 Logging.Log.WriteErrorMessage(Logtag, "ErrorCopyingObjectMinio", null,
                     "Error copying object {0} to {1} in bucket {2} using Minio: {3}",
                     source, target, bucketName, e.ToString());
+
+                throw;
             }
 
             await DeleteObjectAsync(bucketName, source, cancelToken).ConfigureAwait(false);
@@ -138,6 +166,9 @@ namespace Duplicati.Library.Backend
                 Logging.Log.WriteErrorMessage(Logtag, "ErrorGettingObjectMinio", null,
                     "Error getting object {0} to {1} using Minio: {2}",
                     keyName, bucketName, e.ToString());
+
+                ParseAndThrowNotFoundException(e, keyName, bucketName);
+                throw;
             }
         }
 
@@ -167,12 +198,16 @@ namespace Duplicati.Library.Backend
             }
         }
 
+        private void ParseAndThrowNotFoundException(MinioException e, string keyName, string bucketName)
+        {
+            if (e.ServerResponse?.StatusCode == System.Net.HttpStatusCode.NotFound || e.Response?.Code == "NoSuchKey")
+                throw new FileMissingException($"File {keyName} not found in bucket {bucketName}");
+        }
+
         private void ThrowExceptionIfBucketDoesNotExist(string bucketName)
         {
             if (!m_client.BucketExistsAsync(bucketName).Await())
-            {
                 throw new FolderMissingException($"Bucket {bucketName} does not exist.");
-            }
         }
 
 
