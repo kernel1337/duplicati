@@ -3,13 +3,14 @@
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <OutputType>Library</OutputType>
-    <Copyright>Copyright © 2024 Team Duplicati, MIT license</Copyright>
+    <Copyright>Copyright © 2025 Team Duplicati, MIT license</Copyright>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\Interface\Duplicati.Library.Interface.csproj" />
     <ProjectReference Include="..\..\Localization\Duplicati.Library.Localization.csproj" />
     <ProjectReference Include="..\..\Utility\Duplicati.Library.Utility.csproj" />
+    <ProjectReference Include="..\..\SourceProvider\Builtin\Duplicati.Library.SourceProvider.Builtin.csproj" />
   </ItemGroup>
   
   <ItemGroup>

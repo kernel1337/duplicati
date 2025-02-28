@@ -65,8 +65,9 @@ namespace Duplicati.UnitTest
                 {
                     if (path.EndsWith(this.fileSizes[2] + "MB"))
                     {
-                        stopped.TrySetResult(true);
+                        Thread.Sleep(500);
                         controller.Stop();
+                        stopped.TrySetResult(true);
                     }
                 };
 #endif
@@ -102,7 +103,8 @@ namespace Duplicati.UnitTest
 
                 // This allows us to inspect the dlist files without needing the BackendManager (which is inaccessible here) to decrypt them.
                 ["no-encryption"] = "true",
-                ["disable-file-scanner"] = "true"
+                ["disable-file-scanner"] = "true",
+                ["concurrency-fileprocessors"] = "1",
             };
 
             // Run a full backup.
@@ -206,7 +208,8 @@ namespace Duplicati.UnitTest
             Dictionary<string, string> options = new Dictionary<string, string>(this.TestOptions)
             {
                 ["dblock-size"] = "10mb",
-                ["disable-file-scanner"] = "true"
+                ["disable-file-scanner"] = "true",
+                ["concurrency-fileprocessors"] = "1",
             };
 
             // First, run two complete backups followed by a partial backup. We will then set the keep-time
@@ -300,6 +303,7 @@ namespace Duplicati.UnitTest
             {
                 ["dblock-size"] = "10mb",
                 ["disable-file-scanner"] = "true",
+                ["concurrency-fileprocessors"] = "1",
             };
 
             // Run a full backup.
@@ -394,7 +398,8 @@ namespace Duplicati.UnitTest
             {
                 ["dblock-size"] = "10mb",
                 ["no-local-db"] = "true",
-                ["disable-file-scanner"] = "true"
+                ["disable-file-scanner"] = "true",
+                ["concurrency-fileprocessors"] = "1",
             };
 
             // Run a full backup.
@@ -435,7 +440,8 @@ namespace Duplicati.UnitTest
                 // This test assumes that we can perform 3 backups within 1 minute.
                 ["retention-policy"] = "1m:59s,U:1m",
                 ["no-backend-verification"] = "true",
-                ["disable-file-scanner"] = "true"
+                ["disable-file-scanner"] = "true",
+                ["concurrency-fileprocessors"] = "1"
             };
 
             DateTime firstBackupTime;
@@ -573,6 +579,7 @@ namespace Duplicati.UnitTest
                 // Choose a dblock size that is small enough so that more than one volume is needed.
                 ["dblock-size"] = "10mb",
                 ["disable-file-scanner"] = "true",
+                ["concurrency-fileprocessors"] = "1"
             };
 
             // Run a complete backup.
@@ -676,7 +683,8 @@ namespace Duplicati.UnitTest
             {
                 ["dblock-size"] = "10mb",
                 ["disable-synthetic-filelist"] = "true",
-                ["disable-file-scanner"] = "true"
+                ["disable-file-scanner"] = "true",
+                ["concurrency-fileprocessors"] = "1",
             };
 
             // Run a complete backup.
@@ -742,6 +750,106 @@ namespace Duplicati.UnitTest
                     string filename = Path.GetFileName(filepath);
                     TestUtils.AssertFilesAreEqual(filepath, Path.Combine(this.RESTOREFOLDER, filename ?? String.Empty), false, filename);
                 }
+            }
+        }
+
+        [Test]
+        [Category("Disruption")]
+        public void TestFailedUploadWithNoRetries()
+        {
+            var testopts = TestOptions;
+            testopts["number-of-retries"] = "0";
+            testopts["dblock-size"] = "10mb";
+
+            // Make a base backup
+            using (var c = new Library.Main.Controller("file://" + TARGETFOLDER, testopts, null))
+            {
+                IBackupResults backupResults = c.Backup(new string[] { DATAFOLDER });
+                Assert.AreEqual(0, backupResults.Errors.Count());
+                Assert.AreEqual(0, backupResults.Warnings.Count());
+            }
+
+            // Make a new backup that fails uploading a dblock file
+            ModifySourceFiles();
+
+            // Deterministic error backend
+            Library.DynamicLoader.BackendLoader.AddBackend(new DeterministicErrorBackend());
+            var failtarget = new DeterministicErrorBackend().ProtocolKey + "://" + TARGETFOLDER;
+
+            var hasFailed = false;
+            var secondUploadStarted = false;
+            var secondUploadCompleted = false;
+
+            // Fail the compact after the first dblock put is completed
+            DeterministicErrorBackend.ErrorGenerator = (DeterministicErrorBackend.BackendAction action, string remotename) =>
+            {
+                if (action.IsGetOperation)
+                {
+                    return true;
+                }
+
+                if (!hasFailed && action == DeterministicErrorBackend.BackendAction.PutBefore)
+                {
+                    // We only fail one upload, but there are no retries
+                    hasFailed = true;
+
+                    // Make sure we can start a second upload
+                    Thread.Sleep(1000);
+                    return true;
+                }
+
+                if (action == DeterministicErrorBackend.BackendAction.PutBefore)
+                    secondUploadStarted = true;
+                if (action == DeterministicErrorBackend.BackendAction.PutAfter)
+                    secondUploadCompleted = true;
+
+                return false;
+            };
+
+            using (var c = new Library.Main.Controller(failtarget, testopts, null))
+                Assert.Throws<DeterministicErrorBackend.DeterministicErrorBackendException>(() => c.Backup(new string[] { DATAFOLDER }));
+
+            Assert.That(secondUploadStarted, Is.True, "Second upload was not started");
+            Assert.That(secondUploadCompleted, Is.True, "Second upload was not started");
+
+            // Create a regular backup
+            using (var c = new Library.Main.Controller("file://" + TARGETFOLDER, testopts, null))
+            {
+                IBackupResults backupResults = c.Backup(new string[] { DATAFOLDER });
+                Assert.AreEqual(0, backupResults.Errors.Count());
+                Assert.AreEqual(0, backupResults.Warnings.Count());
+            }
+
+            // Verify that all is in order
+            using (var c = new Library.Main.Controller("file://" + TARGETFOLDER, testopts.Expand(new { full_remote_verification = true }), null))
+            {
+                var r = c.Test(long.MaxValue);
+                Assert.AreEqual(0, r.Errors.Count());
+                Assert.AreEqual(0, r.Warnings.Count());
+                Assert.IsFalse(r.Verifications.Any(p => p.Value.Any()));
+            }
+
+            // Test that we can recreate
+            var recreatedDatabaseFile = Path.Combine(BASEFOLDER, "recreated-database.sqlite");
+            if (File.Exists(recreatedDatabaseFile))
+                File.Delete(recreatedDatabaseFile);
+
+            testopts["dbpath"] = recreatedDatabaseFile;
+
+            using (var c = new Library.Main.Controller("file://" + TARGETFOLDER, testopts, null))
+            {
+                IRepairResults repairResults = c.Repair();
+                Assert.AreEqual(0, repairResults.Errors.Count());
+                Assert.AreEqual(0, repairResults.Warnings.Count());
+            }
+
+            // Check that we have 3 versions
+            using (var c = new Library.Main.Controller("file://" + TARGETFOLDER, testopts, null))
+            {
+                IListResults listResults = c.List();
+                Assert.AreEqual(0, listResults.Errors.Count());
+                Assert.AreEqual(0, listResults.Warnings.Count());
+                Assert.AreEqual(3, listResults.Filesets.Count());
             }
         }
     }

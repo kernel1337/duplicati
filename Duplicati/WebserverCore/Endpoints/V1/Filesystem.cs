@@ -149,11 +149,11 @@ public class Filesystem : IEndpointV1
                     text = x.text,
                     iconCls = x.iconCls,
                     cls = "folder",
-                    leaf = false,
-                    hidden = false,
-                    symlink = false,
-                    temporary = false,
-                    systemFile = false,
+                    leaf = x.leaf,
+                    hidden = x.hidden,
+                    symlink = x.symlink,
+                    temporary = x.temporary,
+                    systemFile = x.systemFile,
                     fileSize = -1,
                     resolvedpath = x.id,
                     check = false
@@ -254,11 +254,11 @@ public class Filesystem : IEndpointV1
             {
                 var attr = SystemIO.IO_OS.GetFileAttributes(s);
                 var isSymlink = SystemIO.IO_OS.IsSymlink(s, attr);
-                var isFolder = (attr & FileAttributes.Directory) != 0;
+                var isFolder = attr.HasFlag(FileAttributes.Directory);
                 var isFile = !isFolder;
-                var isHidden = (attr & FileAttributes.Hidden) != 0;
-                bool isSystem = (attr & FileAttributes.System) != 0;
-                bool isTemporary = (attr & FileAttributes.Temporary) != 0;
+                var isHidden = attr.HasFlag(FileAttributes.Hidden);
+                bool isSystem = attr.HasFlag(FileAttributes.System);
+                bool isTemporary = attr.HasFlag(FileAttributes.Temporary);
                 long fileSize = -1;
 
                 var accessible = isFile || canAccess(s);

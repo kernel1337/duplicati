@@ -22,6 +22,7 @@ using System.CommandLine;
 using System.CommandLine.Builder;
 using System.CommandLine.Parsing;
 using Duplicati.CommandLine.ServerUtil.Commands;
+using Duplicati.Library.Utility;
 
 namespace Duplicati.CommandLine.ServerUtil;
 
@@ -52,6 +53,7 @@ public static class Program
                 Export.Create(),
                 Health.Create(),
                 IssueForeverToken.Create(),
+                ServerStatus.Create(),
             };
 
         rootCmd = SettingsBinder.AddGlobalOptions(rootCmd);
@@ -79,6 +81,7 @@ public static class Program
 
                 await next(context);
             })
+            .UseAdditionalHelpAliases()
             .Build()
             .InvokeAsync(args);
     }

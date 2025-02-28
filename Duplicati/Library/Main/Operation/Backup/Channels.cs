@@ -20,6 +20,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 using CoCoL;
+using Duplicati.Library.Interface;
 
 namespace Duplicati.Library.Main.Operation.Backup
 {
@@ -28,10 +29,6 @@ namespace Duplicati.Library.Main.Operation.Backup
     /// </summary>
     internal class Channels
     {
-        /// <summary>
-        /// Requests to the backend are send over this channel and picked up by the <see cref="BackendUploader" /> class
-        /// </summary>
-        public readonly IChannel<IUploadRequest> BackendRequest = ChannelManager.CreateChannel<IUploadRequest>();
         /// <summary>
         /// When the backup completes, all in-progress archives are sent from the <see cref="DataBlockProcessor"/> to the <see cref="SpillCollectorProcess"/>
         /// </summary>
@@ -55,7 +52,7 @@ namespace Duplicati.Library.Main.Operation.Backup
         /// <summary>
         /// When enumerating the source folders, all discovered paths are sent by the <see cref="FileEnumerationProcess"/> to the <see cref="MetadataPreProcess"/>
         /// </summary>
-        public readonly IChannel<string> SourcePaths = ChannelManager.CreateChannel<string>();
+        public readonly IChannel<ISourceProviderEntry> SourcePaths = ChannelManager.CreateChannel<ISourceProviderEntry>();
         /// <summary>
         /// All progress events are communicated over this channel, to ensure that parallel progress is reported as a if it was sequential
         /// </summary>
